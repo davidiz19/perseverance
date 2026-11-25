@@ -1,0 +1,17 @@
+{
+  "name": "perseverance",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host --port 5173",
+    "build": "vite build",
+    "check": "node scripts/check.mjs"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.47.2",
+    "vite": "^5.4.0"
+  }
+}
