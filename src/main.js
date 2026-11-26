@@ -1,5 +1,12 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+import { createMissionControl } from './missionControl.js';
+import { splitWheels, RoverDynamics } from './roverPhysics.js';
+import { setupCameras } from './cameras.js';
+
+createMissionControl();
 
 // ---------- noise ----------
 function hash(x, y) { const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453; return s - Math.floor(s); }
@@ -38,7 +45,8 @@ const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 40
 camera.position.set(0, height(0, 40) + 6, 40);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.target.set(0, height(0, 0) + 4, -20);
-controls.enableDamping = true; controls.autoRotate = true; controls.autoRotateSpeed = 0.15;
+controls.enableDamping = true;
+controls.minDistance = 4; controls.maxDistance = 60;
 controls.maxPolarAngle = Math.PI * 0.49;
 
 // ---------- sun ----------
@@ -47,7 +55,7 @@ const sun = new THREE.DirectionalLight('#ffd2a0', 3.2);
 sun.position.copy(sunDir).multiplyScalar(200);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
-Object.assign(sun.shadow.camera, { left: -120, right: 120, top: 120, bottom: -120, near: 1, far: 600 });
+Object.assign(sun.shadow.camera, { left: -60, right: 60, top: 60, bottom: -60, near: 1, far: 600 });
 sun.shadow.radius = 4; sun.shadow.bias = -0.0005; sun.shadow.normalBias = 0.05;
 scene.add(sun, sun.target);
 scene.add(new THREE.HemisphereLight('#f0b88a', '#8a4a2a', 1.6));
@@ -85,6 +93,16 @@ for (let i = 0; i < tp.count; i++) {
   tmp.copy(cA).lerp(cB, THREE.MathUtils.clamp(n * 0.8 + y * 0.01, 0, 1)).lerp(cC, THREE.MathUtils.clamp(fbm(x * 0.05, z * 0.05 + 9, 2), 0, 0.5));
   cols.set([tmp.r, tmp.g, tmp.b], i * 3);
 }
+// exact height of the rendered mesh (matches PlaneGeometry triangulation)
+const STEP = SIZE / SEG, HALF = SIZE / 2;
+function groundY(x, z) {
+  const gx = (x + HALF) / STEP, gz = (z + HALF) / STEP;
+  const ix = Math.min(SEG - 1, Math.max(0, Math.floor(gx))), iz = Math.min(SEG - 1, Math.max(0, Math.floor(gz)));
+  const fx = gx - ix, fz = gz - iz, row = SEG + 1;
+  const a = tp.getY(iz * row + ix), d = tp.getY(iz * row + ix + 1);
+  const b = tp.getY((iz + 1) * row + ix), c = tp.getY((iz + 1) * row + ix + 1);
+  return fx + fz < 1 ? a + (d - a) * fx + (b - a) * fz : c + (b - c) * (1 - fx) + (d - c) * (1 - fz);
+}
 tg.setAttribute('color', new THREE.BufferAttribute(cols, 3));
 tg.computeVertexNormals();
 const terrain = new THREE.Mesh(tg, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95 }));
@@ -105,10 +123,10 @@ rocks.castShadow = rocks.receiveShadow = true;
 const m = new THREE.Matrix4(), q = new THREE.Quaternion(), sc = new THREE.Vector3(), pos = new THREE.Vector3();
 let seed = 1; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
 for (let i = 0; i < ROCKS; i++) {
-  const r = 14 + Math.pow(rnd(), 0.7) * 220, a = rnd() * Math.PI * 2;
+  const r = 22 + Math.pow(rnd(), 0.7) * 220, a = rnd() * Math.PI * 2;
   const x = Math.cos(a) * r, z = Math.sin(a) * r - 10;
   const s = 0.15 + Math.pow(rnd(), 5) * 3.5 * Math.min(1, r / 40);
-  pos.set(x, height(x, z) + s * 0.15, z);
+  pos.set(x, groundY(x, z) + s * 0.15, z);
   q.setFromEuler(new THREE.Euler(rnd() * 0.5, rnd() * 6.28, rnd() * 0.5));
   sc.set(s * (0.8 + rnd() * 0.6), s, s * (0.8 + rnd() * 0.6));
   rocks.setMatrixAt(i, m.compose(pos, q, sc));
@@ -139,11 +157,116 @@ const dg = new THREE.BufferGeometry(); dg.setAttribute('position', new THREE.Buf
 const dust_pts = new THREE.Points(dg, new THREE.PointsMaterial({ color: '#e8b890', size: 0.25, transparent: true, opacity: 0.5, depthWrite: false }));
 scene.add(dust_pts);
 
+// ---------- rover ----------
+const rover = new THREE.Group(); // pivot: position on ground, heading in rotation
+scene.add(rover);
+rover.position.set(0, groundY(0, 15), 15);
+let ready = false, dyn = null, camSpots = null;
+const ROVER_LENGTH = 3.0; // Perseverance: ~3 m long, 2.7 m wide, 2.2 m tall
+const gltfLoader = new GLTFLoader().setDRACOLoader(new DRACOLoader().setDecoderPath('/draco/'));
+gltfLoader.load('/models/perseverance.glb', (gltf) => {
+  const model = gltf.scene;
+  const cams = [];
+  model.traverse((o) => {
+    if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; }
+    if (/cam|watson|lens/i.test(o.name) && !/bracket|cover|wiring/i.test(o.name)) cams.push(o.name);
+  });
+  console.log('Cámaras del rover: ' + cams.join(', '));
+  // Real-size scale from horizontal extent
+  let box = new THREE.Box3().setFromObject(model), size = box.getSize(new THREE.Vector3());
+  model.scale.setScalar(ROVER_LENGTH / Math.max(size.x, size.z));
+  // Orient so front hazcams face -Z (forward)
+  model.updateMatrixWorld(true);
+  const center = new THREE.Box3().setFromObject(model).getCenter(new THREE.Vector3());
+  const front = model.getObjectByName('hazcams_front');
+  if (front) {
+    const fp = front.getWorldPosition(new THREE.Vector3()).sub(center);
+    model.rotation.y = Math.atan2(fp.x, fp.z) + Math.PI; // rotate so front -> -Z
+  }
+  // Re-center and put wheels on ground
+  model.updateMatrixWorld(true);
+  box = new THREE.Box3().setFromObject(model);
+  const c = box.getCenter(new THREE.Vector3());
+  model.position.set(-c.x, -box.min.y, -c.z);
+  rover.add(model);
+  const wheels = splitWheels(model, rover);
+  console.log(`Física: ${wheels.length} ruedas separadas, radio ${(wheels[0].radius * 100).toFixed(1)} cm`);
+  dyn = new RoverDynamics(rover, wheels, groundY);
+  window.rover = dyn; // inspect from the console
+  camSpots = setupCameras({ model, rover, camera, renderer, keys });
+  ready = true;
+});
+
+// ---------- input ----------
+const keys = {};
+addEventListener('keydown', (e) => { keys[e.code] = true; });
+addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+// ---------- tracks (wheel ruts) ----------
+const TRACKS = 6000;
+const trackGeo = new THREE.PlaneGeometry(0.45, 0.4); trackGeo.rotateX(-Math.PI / 2);
+const tracks = new THREE.InstancedMesh(trackGeo, new THREE.MeshStandardMaterial({
+  color: '#3a1408', roughness: 1, transparent: true, opacity: 0.75, depthWrite: false,
+  polygonOffset: true, polygonOffsetFactor: -4 }), TRACKS);
+tracks.count = 0; tracks.receiveShadow = true; tracks.frustumCulled = false;
+scene.add(tracks);
+let trackIdx = 0, sinceTrack = 0;
+const up = new THREE.Vector3(0, 1, 0), nrm = new THREE.Vector3(), tq = new THREE.Quaternion(), hq = new THREE.Quaternion();
+function groundNormal(x, z, out) {
+  const e = 0.6;
+  return out.set(groundY(x - e, z) - groundY(x + e, z), 2 * e, groundY(x, z - e) - groundY(x, z + e)).normalize();
+}
+function dropTracks() {
+  for (const c of dyn.rearContacts()) {
+    const x = c.x, z = c.z;
+    groundNormal(x, z, nrm);
+    tq.setFromUnitVectors(up, nrm).multiply(hq.setFromAxisAngle(up, dyn.heading));
+    tracks.setMatrixAt(trackIdx, m.compose(pos.set(x, groundY(x, z) + 0.03, z), tq, sc.set(1, 1, 1)));
+    trackIdx = (trackIdx + 1) % TRACKS;
+    tracks.count = Math.max(tracks.count, trackIdx === 0 ? TRACKS : trackIdx);
+  }
+  tracks.instanceMatrix.needsUpdate = true;
+}
+
+// camera starts behind the rover
+camera.position.set(0, rover.position.y + 2.5, 24);
+controls.target.set(0, rover.position.y + 1.2, 15);
+
 // ---------- loop ----------
 const clock = new THREE.Clock();
+const prev = new THREE.Vector3(), delta = new THREE.Vector3();
 renderer.setAnimationLoop(() => {
-  const t = clock.getElapsedTime();
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  if (ready) {
+    const fwd = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
+    const turn = (keys.KeyA ? 1 : 0) - (keys.KeyD ? 1 : 0);
+    prev.copy(rover.position);
+    dyn.update(dt, fwd, turn);
+    const speed = dyn.speed, heading = dyn.heading;
+    sinceTrack += rover.position.distanceTo(prev);
+    if (sinceTrack > 0.3) { sinceTrack = 0; dropTracks(); }
+    // camera follows: move camera & target by rover delta
+    delta.subVectors(rover.position, prev);
+    camera.position.add(delta);
+    // when driving, swing the camera gently behind the rover (mouse orbit still works)
+    if (Math.abs(speed) > 0.2) {
+      const off = camera.position.clone().sub(controls.target);
+      const yaw = Math.atan2(off.x, off.z);
+      let d = heading - yaw; d = Math.atan2(Math.sin(d), Math.cos(d));
+      off.applyAxisAngle(up, d * (1 - Math.exp(-1.5 * dt)));
+      camera.position.copy(controls.target).add(off);
+    }
+    controls.target.set(rover.position.x, rover.position.y + 1.2, rover.position.z);
+    const minY = groundY(camera.position.x, camera.position.z) + 1;
+    if (Math.abs(speed) > 0.2) camera.position.y = THREE.MathUtils.lerp(camera.position.y, rover.position.y + 2.5, 1 - Math.exp(-2 * dt));
+    if (camera.position.y < minY) camera.position.y = minY;
+    // shadows follow rover for crisp detail
+    sun.target.position.copy(rover.position);
+    sun.position.copy(rover.position).addScaledVector(sunDir, 200);
+  }
   dust_pts.position.x = (t * 1.5) % 40 - 20; dust_pts.position.y = Math.sin(t * 0.3) * 0.5;
+  camSpots?.tick();
   phobos.rotation.y = t * 0.02; deimos.rotation.y = t * 0.01;
   controls.update();
   renderer.render(scene, camera);
